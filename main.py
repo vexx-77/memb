@@ -1,3 +1,4 @@
+# привет
 import os
 import asyncio
 import time
