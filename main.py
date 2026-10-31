@@ -30,6 +30,9 @@ channel_titles = {LINK_CHANNEL: str(LINK_CHANNEL), SUB_CHANNEL: str(SUB_CHANNEL)
 admin_msgs = set()
 last_stats_msg = None
 
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+
 
 def ensure_dirs():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -208,12 +211,14 @@ async def on_chat_member(ev: ChatMemberUpdated) -> None:
 
 @dp.message(Command("start"), F.from_user.id == ADMIN)
 async def cmd_start(msg: Message) -> None:
+    admin_msgs.add((msg.chat.id, msg.message_id))
     await send_stats(msg.chat.id)
 
 
 @dp.message(Command("play"), F.from_user.id == ADMIN)
 async def cmd_play(msg: Message) -> None:
     write_state("1")
+    admin_msgs.add((msg.chat.id, msg.message_id))
     await cleanup_admin_msgs()
     await reply_admin(msg.chat.id, "🟢 Бот включён")
 
@@ -221,6 +226,7 @@ async def cmd_play(msg: Message) -> None:
 @dp.message(Command("stop"), F.from_user.id == ADMIN)
 async def cmd_stop(msg: Message) -> None:
     write_state("0")
+    admin_msgs.add((msg.chat.id, msg.message_id))
     await cleanup_admin_msgs()
     await reply_admin(msg.chat.id, "🔴 Бот выключен")
 
