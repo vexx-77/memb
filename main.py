@@ -7,7 +7,10 @@ from pathlib import Path
 import aiosqlite
 from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import ChatJoinRequest, ChatMemberUpdated, Message
+from aiogram.types import (
+    ChatJoinRequest, ChatMemberUpdated, Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
 from aiogram.filters import Command
 from aiogram.enums import ChatMemberStatus, ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -23,6 +26,9 @@ STATE_FILE = DATA_DIR / "state.txt"
 DB_FILE = DATA_DIR / "stats.db"
 
 db = None
+channel_titles = {LINK_CHANNEL: str(LINK_CHANNEL), SUB_CHANNEL: str(SUB_CHANNEL)}
+admin_msgs = set()
+last_stats_msg = None
 
 
 def ensure_dirs():
@@ -100,6 +106,18 @@ async def period_stats(since: int) -> dict:
     }
 
 
+async def load_channel_titles() -> None:
+    for ch in (LINK_CHANNEL, SUB_CHANNEL):
+        try:
+            chat = await bot.get_chat(ch)
+            title = chat.title or str(ch)
+            if chat.username:
+                title = f"{title} (@{chat.username})"
+            channel_titles[ch] = title
+        except Exception:
+            channel_titles[ch] = str(ch)
+
+
 async def build_stats() -> str:
     now = datetime.now(timezone.utc)
     day_start = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
@@ -115,18 +133,46 @@ async def build_stats() -> str:
         "<b>📊 Статистика бота</b>",
         f"Статус: {status}",
         "",
+        f"📥 <b>Авто заявки:</b> {channel_titles[LINK_CHANNEL]}",
+        f"🚫 <b>Авто кик:</b> {channel_titles[SUB_CHANNEL]}",
+        "",
     ]
     for title, s in [("📅 За день", d), ("📆 За месяц", m), ("🗓 За всё время", a)]:
         parts.append(f"<b>{title}</b>")
         parts.append(f"✅ Принято заявок: <code>{s['accepted']}</code>")
         parts.append(f"🚫 Кикнуто подписчиков: <code>{s['kicked']}</code>")
-        parts.append(f"👤 Уникальных пользователей: <code>{s['unique']}</code>")
+        parts.append(f"👤 Уникальных: <code>{s['unique']}</code>")
         parts.append("")
     return "\n".join(parts)
 
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+def stats_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh")]
+    ])
+
+
+async def cleanup_admin_msgs() -> None:
+    for chat_id, mid in list(admin_msgs):
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    admin_msgs.clear()
+
+
+async def send_stats(chat_id: int) -> None:
+    global last_stats_msg
+    await cleanup_admin_msgs()
+    text = await build_stats()
+    msg = await bot.send_message(chat_id, text, reply_markup=stats_keyboard())
+    admin_msgs.add((chat_id, msg.message_id))
+    last_stats_msg = (chat_id, msg.message_id)
+
+
+async def reply_admin(chat_id: int, text: str) -> None:
+    msg = await bot.send_message(chat_id, text)
+    admin_msgs.add((chat_id, msg.message_id))
 
 
 @dp.chat_join_request(F.chat.id == LINK_CHANNEL)
@@ -162,19 +208,63 @@ async def on_chat_member(ev: ChatMemberUpdated) -> None:
 
 @dp.message(Command("start"), F.from_user.id == ADMIN)
 async def cmd_start(msg: Message) -> None:
-    await msg.answer(await build_stats())
+    await send_stats(msg.chat.id)
 
 
 @dp.message(Command("play"), F.from_user.id == ADMIN)
 async def cmd_play(msg: Message) -> None:
     write_state("1")
-    await msg.answer("🟢 Бот включён")
+    await cleanup_admin_msgs()
+    await reply_admin(msg.chat.id, "🟢 Бот включён")
 
 
 @dp.message(Command("stop"), F.from_user.id == ADMIN)
 async def cmd_stop(msg: Message) -> None:
     write_state("0")
-    await msg.answer("🔴 Бот выключен")
+    await cleanup_admin_msgs()
+    await reply_admin(msg.chat.id, "🔴 Бот выключен")
+
+
+@dp.message(F.from_user.id == ADMIN)
+async def admin_any(msg: Message) -> None:
+    await cleanup_admin_msgs()
+    admin_msgs.add((msg.chat.id, msg.message_id))
+
+
+@dp.callback_query(F.data == "refresh", F.from_user.id == ADMIN)
+async def cb_refresh(cb: CallbackQuery) -> None:
+    global last_stats_msg
+    if not cb.message:
+        await cb.answer()
+        return
+    try:
+        text = await build_stats()
+        await bot.edit_message_text(
+            text=text,
+            chat_id=cb.message.chat.id,
+            message_id=cb.message.message_id,
+            reply_markup=stats_keyboard(),
+        )
+        last_stats_msg = (cb.message.chat.id, cb.message.message_id)
+    except Exception:
+        pass
+    await cb.answer("Обновлено")
+
+
+async def auto_refresh_stats() -> None:
+    while True:
+        await asyncio.sleep(6 * 3600)
+        if last_stats_msg and last_stats_msg in admin_msgs:
+            try:
+                text = await build_stats()
+                await bot.edit_message_text(
+                    text=text,
+                    chat_id=last_stats_msg[0],
+                    message_id=last_stats_msg[1],
+                    reply_markup=stats_keyboard(),
+                )
+            except Exception:
+                pass
 
 
 async def health(_request):
@@ -207,12 +297,14 @@ async def main() -> None:
     ensure_dirs()
     read_state()
     await get_db()
+    await load_channel_titles()
     await start_web()
     asyncio.create_task(self_ping())
+    asyncio.create_task(auto_refresh_stats())
     try:
         await dp.start_polling(
             bot,
-            allowed_updates=["message", "chat_join_request", "chat_member"],
+            allowed_updates=["message", "chat_join_request", "chat_member", "callback_query"],
         )
     finally:
         await bot.session.close()
