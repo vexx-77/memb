@@ -33,9 +33,12 @@ last_stats_msg = None
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh")]
-])
+def stats_keyboard() -> InlineKeyboardMarkup:
+    action = "Стоп" if read_state() == "1" else "Старт"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh")],
+        [InlineKeyboardButton(text=action, callback_data="toggle_state")],
+    ])
 
 
 def ensure_dirs():
@@ -164,7 +167,7 @@ async def cleanup_admin_msgs() -> None:
 async def send_stats(chat_id: int) -> None:
     global last_stats_msg
     await cleanup_admin_msgs()
-    msg = await bot.send_message(chat_id, await build_stats(), reply_markup=KEYBOARD)
+    msg = await bot.send_message(chat_id, await build_stats(), reply_markup=stats_keyboard())
     admin_msgs.add((chat_id, msg.message_id))
     last_stats_msg = (chat_id, msg.message_id)
 
@@ -234,6 +237,25 @@ async def admin_any(msg: Message) -> None:
     admin_msgs.add((msg.chat.id, msg.message_id))
 
 
+@dp.callback_query(F.data == "toggle_state", F.from_user.id == ADMIN)
+async def cb_toggle_state(cb: CallbackQuery) -> None:
+    global last_stats_msg
+    new_state = "0" if read_state() == "1" else "1"
+    write_state(new_state)
+    if cb.message:
+        try:
+            await bot.edit_message_text(
+                text=await build_stats(),
+                chat_id=cb.message.chat.id,
+                message_id=cb.message.message_id,
+                reply_markup=stats_keyboard(),
+            )
+            last_stats_msg = (cb.message.chat.id, cb.message.message_id)
+        except Exception:
+            pass
+    await cb.answer("Бот остановлен" if new_state == "0" else "Бот запущен")
+
+
 @dp.callback_query(F.data == "refresh", F.from_user.id == ADMIN)
 async def cb_refresh(cb: CallbackQuery) -> None:
     global last_stats_msg
@@ -243,7 +265,7 @@ async def cb_refresh(cb: CallbackQuery) -> None:
                 text=await build_stats(),
                 chat_id=cb.message.chat.id,
                 message_id=cb.message.message_id,
-                reply_markup=KEYBOARD,
+                reply_markup=stats_keyboard(),
             )
             last_stats_msg = (cb.message.chat.id, cb.message.message_id)
         except Exception:
@@ -260,7 +282,7 @@ async def auto_refresh() -> None:
                     text=await build_stats(),
                     chat_id=last_stats_msg[0],
                     message_id=last_stats_msg[1],
-                    reply_markup=KEYBOARD,
+                    reply_markup=stats_keyboard(),
                 )
             except Exception:
                 pass
@@ -312,3 +334,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
