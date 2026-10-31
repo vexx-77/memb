@@ -29,9 +29,11 @@ db = None
 titles = {LINK_CHANNEL: str(LINK_CHANNEL), SUB_CHANNEL: str(SUB_CHANNEL)}
 admin_msgs = set()
 last_stats_msg = None
+queue_event = asyncio.Event()
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
 
 def stats_keyboard() -> InlineKeyboardMarkup:
     action = "Стоп" if read_state() == "1" else "Старт"
@@ -77,6 +79,7 @@ async def get_db():
             "PRAGMA cache_size=-2000",
         ):
             await db.execute(p)
+
         await db.execute(
             "CREATE TABLE IF NOT EXISTS events ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -85,32 +88,104 @@ async def get_db():
             "ts INTEGER NOT NULL)"
         )
         await db.execute("CREATE INDEX IF NOT EXISTS idx_ts ON events(ts)")
+
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS pending_requests ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "chat_id INTEGER NOT NULL,"
+            "user_id INTEGER NOT NULL,"
+            "ts INTEGER NOT NULL,"
+            "UNIQUE(chat_id, user_id))"
+        )
+
         await db.commit()
     return db
 
 
 async def log_event(kind: str, user_id: int) -> None:
     d = await get_db()
-    cur = await d.execute(
+    await d.execute(
         "INSERT INTO events (type, user_id, ts) VALUES (?, ?, ?)",
         (kind, user_id, int(time.time())),
     )
-    await cur.close()
     await d.commit()
+
+
+async def save_request(chat_id: int, user_id: int) -> None:
+    d = await get_db()
+    await d.execute(
+        "INSERT OR IGNORE INTO pending_requests (chat_id, user_id, ts) VALUES (?, ?, ?)",
+        (chat_id, user_id, int(time.time())),
+    )
+    await d.commit()
+    queue_event.set()
+
+
+async def process_requests() -> None:
+    d = await get_db()
+
+    while True:
+        if read_state() != "1":
+            queue_event.clear()
+            try:
+                await asyncio.wait_for(queue_event.wait(), timeout=0.2)
+            except asyncio.TimeoutError:
+                pass
+            continue
+
+        cur = await d.execute(
+            "SELECT id, chat_id, user_id FROM pending_requests ORDER BY id LIMIT 1"
+        )
+        request = await cur.fetchone()
+        await cur.close()
+
+        if request is None:
+            queue_event.clear()
+            try:
+                await asyncio.wait_for(queue_event.wait(), timeout=0.2)
+            except asyncio.TimeoutError:
+                pass
+            continue
+
+        request_id, chat_id, user_id = request
+
+        if read_state() != "1":
+            continue
+
+        try:
+            await bot.approve_chat_join_request(chat_id, user_id)
+
+            await d.execute(
+                "DELETE FROM pending_requests WHERE id = ?",
+                (request_id,),
+            )
+            await d.commit()
+
+            await log_event("accepted", user_id)
+
+        except Exception:
+            await asyncio.sleep(5)
+            continue
+
+        await asyncio.sleep(0.2)
 
 
 async def period_stats(since: int) -> tuple:
     d = await get_db()
     cur = await d.execute(
-        "SELECT type, COUNT(*) FROM events WHERE ts >= ? GROUP BY type", (since,)
+        "SELECT type, COUNT(*) FROM events WHERE ts >= ? GROUP BY type",
+        (since,),
     )
     counts = dict(await cur.fetchall())
     await cur.close()
+
     cur = await d.execute(
-        "SELECT COUNT(DISTINCT user_id) FROM events WHERE ts >= ?", (since,)
+        "SELECT COUNT(DISTINCT user_id) FROM events WHERE ts >= ?",
+        (since,),
     )
     row = await cur.fetchone()
     await cur.close()
+
     return counts.get("accepted", 0), counts.get("kicked", 0), (row[0] if row else 0)
 
 
@@ -144,6 +219,7 @@ async def build_stats() -> str:
         f"🚫 <b>Авто кик:</b> {titles[SUB_CHANNEL]}",
         "",
     ]
+
     for title, (acc, kick, uniq) in (
         ("📅 За день", d), ("📆 За месяц", m), ("🗓 За всё время", a)
     ):
@@ -152,6 +228,7 @@ async def build_stats() -> str:
         parts.append(f"🚫 Кикнуто: <code>{kick}</code>")
         parts.append(f"👤 Уникальных: <code>{uniq}</code>")
         parts.append("")
+
     return "\n".join(parts)
 
 
@@ -167,7 +244,11 @@ async def cleanup_admin_msgs() -> None:
 async def send_stats(chat_id: int) -> None:
     global last_stats_msg
     await cleanup_admin_msgs()
-    msg = await bot.send_message(chat_id, await build_stats(), reply_markup=stats_keyboard())
+    msg = await bot.send_message(
+        chat_id,
+        await build_stats(),
+        reply_markup=stats_keyboard(),
+    )
     admin_msgs.add((chat_id, msg.message_id))
     last_stats_msg = (chat_id, msg.message_id)
 
@@ -179,13 +260,7 @@ async def reply_admin(chat_id: int, text: str) -> None:
 
 @dp.chat_join_request(F.chat.id == LINK_CHANNEL)
 async def on_join_request(req: ChatJoinRequest) -> None:
-    if read_state() != "1":
-        return
-    try:
-        await req.approve()
-    except Exception:
-        return
-    await log_event("accepted", req.from_user.id)
+    await save_request(req.chat.id, req.from_user.id)
 
 
 @dp.chat_member(F.chat.id == SUB_CHANNEL)
@@ -196,16 +271,20 @@ async def on_chat_member(ev: ChatMemberUpdated) -> None:
         return
     if ev.old_chat_member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
         return
+
     uid = ev.new_chat_member.user.id
+
     try:
         await bot.ban_chat_member(SUB_CHANNEL, uid)
         await bot.unban_chat_member(SUB_CHANNEL, uid)
     except Exception:
         pass
+
     try:
         await bot.unban_chat_member(LINK_CHANNEL, uid)
     except Exception:
         pass
+
     await log_event("kicked", uid)
 
 
@@ -218,6 +297,7 @@ async def cmd_start(msg: Message) -> None:
 @dp.message(Command("play"), F.from_user.id == ADMIN)
 async def cmd_play(msg: Message) -> None:
     write_state("1")
+    queue_event.set()
     admin_msgs.add((msg.chat.id, msg.message_id))
     await cleanup_admin_msgs()
     await reply_admin(msg.chat.id, "🟢 Бот включён")
@@ -240,8 +320,13 @@ async def admin_any(msg: Message) -> None:
 @dp.callback_query(F.data == "toggle_state", F.from_user.id == ADMIN)
 async def cb_toggle_state(cb: CallbackQuery) -> None:
     global last_stats_msg
+
     new_state = "0" if read_state() == "1" else "1"
     write_state(new_state)
+
+    if new_state == "1":
+        queue_event.set()
+
     if cb.message:
         try:
             await bot.edit_message_text(
@@ -253,12 +338,14 @@ async def cb_toggle_state(cb: CallbackQuery) -> None:
             last_stats_msg = (cb.message.chat.id, cb.message.message_id)
         except Exception:
             pass
+
     await cb.answer("Бот остановлен" if new_state == "0" else "Бот запущен")
 
 
 @dp.callback_query(F.data == "refresh", F.from_user.id == ADMIN)
 async def cb_refresh(cb: CallbackQuery) -> None:
     global last_stats_msg
+
     if cb.message:
         try:
             await bot.edit_message_text(
@@ -270,12 +357,14 @@ async def cb_refresh(cb: CallbackQuery) -> None:
             last_stats_msg = (cb.message.chat.id, cb.message.message_id)
         except Exception:
             pass
+
     await cb.answer("Обновлено")
 
 
 async def auto_refresh() -> None:
     while True:
         await asyncio.sleep(6 * 3600)
+
         if last_stats_msg and last_stats_msg in admin_msgs:
             try:
                 await bot.edit_message_text(
@@ -294,6 +383,7 @@ async def health(_):
 
 async def self_ping() -> None:
     url = f"http://127.0.0.1:{PORT}/health"
+
     async with ClientSession() as s:
         while True:
             try:
@@ -301,6 +391,7 @@ async def self_ping() -> None:
                     await r.read()
             except Exception:
                 pass
+
             await asyncio.sleep(60)
 
 
@@ -308,6 +399,7 @@ async def start_web() -> None:
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
@@ -319,8 +411,11 @@ async def main() -> None:
     await get_db()
     await load_titles()
     await start_web()
+
     asyncio.create_task(self_ping())
     asyncio.create_task(auto_refresh())
+    asyncio.create_task(process_requests())
+
     try:
         await dp.start_polling(
             bot,
@@ -334,4 +429,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
