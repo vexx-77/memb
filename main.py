@@ -2,7 +2,6 @@
 import os
 import asyncio
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -102,7 +101,7 @@ async def get_db():
             "ts INTEGER NOT NULL)"
         )
 
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_ts ON events(ts)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_type_user ON events(type, user_id)")
         await db.commit()
 
     return db
@@ -193,26 +192,23 @@ async def process_requests() -> None:
         await asyncio.sleep(0.2)
 
 
-async def period_stats(since: int) -> tuple:
+async def get_all_time_stats() -> tuple:
     d = await get_db()
 
     cur = await d.execute(
-        "SELECT type, COUNT(*) FROM events WHERE ts >= ? GROUP BY type",
-        (since,),
+        "SELECT "
+        "COUNT(*), "
+        "COALESCE(SUM(CASE WHEN type = 'accepted' THEN 1 ELSE 0 END), 0), "
+        "COALESCE(SUM(CASE WHEN type = 'kicked' THEN 1 ELSE 0 END), 0), "
+        "COUNT(DISTINCT user_id), "
+        "COUNT(DISTINCT CASE WHEN type = 'accepted' THEN user_id END), "
+        "COUNT(DISTINCT CASE WHEN type = 'kicked' THEN user_id END) "
+        "FROM events"
     )
 
-    counts = dict(await cur.fetchall())
+    stats = await cur.fetchone()
     await cur.close()
-
-    cur = await d.execute(
-        "SELECT COUNT(DISTINCT user_id) FROM events WHERE ts >= ?",
-        (since,),
-    )
-
-    row = await cur.fetchone()
-    await cur.close()
-
-    return counts.get("accepted", 0), counts.get("kicked", 0), (row[0] if row else 0)
+    return stats
 
 
 async def load_titles() -> None:
@@ -231,19 +227,9 @@ async def load_titles() -> None:
 
 
 async def build_stats() -> str:
-    now = datetime.now(timezone.utc)
-
-    day = int(now.replace(
-        hour=0, minute=0, second=0, microsecond=0
-    ).timestamp())
-
-    month = int(now.replace(
-        day=1, hour=0, minute=0, second=0, microsecond=0
-    ).timestamp())
-
-    daily = await period_stats(day)
-    monthly = await period_stats(month)
-    all_time = await period_stats(0)
+    total, accepted, kicked, unique_total, unique_accepted, unique_kicked = (
+        await get_all_time_stats()
+    )
 
     status = "🟢 Работает" if read_state() == "1" else "🔴 Остановлен"
 
@@ -254,20 +240,13 @@ async def build_stats() -> str:
         f"📥 <b>Авто заявки:</b> {titles[LINK_CHANNEL]}",
         f"🚫 <b>Авто кик:</b> {titles[SUB_CHANNEL]}",
         "",
+        f"📈 Всего событий: <code>{total}</code>",
+        f"✅ Принято заявок: <code>{accepted}</code>",
+        f"👤 Уникальных принятых: <code>{unique_accepted}</code>",
+        f"🚫 Кикнуто: <code>{kicked}</code>",
+        f"👤 Уникальных кикнуто: <code>{unique_kicked}</code>",
+        f"👥 Всего уникальных пользователей: <code>{unique_total}</code>",
     ]
-
-    for title, (accepted, kicked, unique) in (
-        ("📅 За день", daily),
-        ("📆 За месяц", monthly),
-        ("🗓 За всё время", all_time),
-    ):
-        parts.extend((
-            f"<b>{title}</b>",
-            f"✅ Принято: <code>{accepted}</code>",
-            f"🚫 Кикнуто: <code>{kicked}</code>",
-            f"👤 Уникальных: <code>{unique}</code>",
-            "",
-        ))
 
     return "\n".join(parts)
 
@@ -507,4 +486,5 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
