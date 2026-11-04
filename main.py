@@ -7,18 +7,17 @@ import aiosqlite
 from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    ChatJoinRequest, ChatMemberUpdated, Message, CallbackQuery,
+    ChatJoinRequest, Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
 )
 from aiogram.filters import Command
-from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
 
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-LINK_CHANNEL = int(os.environ["LINK_CHANNEL"])
-SUB_CHANNEL = int(os.environ["SUB_CHANNEL"])
+CHANNEL = int(os.environ["CHANNEL"])
 ADMIN = int(os.environ["ADMIN"])
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -29,8 +28,7 @@ DB_FILE = DATA_DIR / "stats.db"
 db = None
 
 titles = {
-    LINK_CHANNEL: str(LINK_CHANNEL),
-    SUB_CHANNEL: str(SUB_CHANNEL),
+    CHANNEL: str(CHANNEL),
 }
 
 admin_msgs = set()
@@ -257,7 +255,6 @@ async def process_requests() -> None:
 async def build_stats() -> str:
     d = await get_db()
 
-    # Один запрос вместо нескольких отдельных запросов.
     cur = await d.execute(
         """
         SELECT
@@ -270,15 +267,7 @@ async def build_stats() -> str:
                     ELSE 0
                 END),
                 0
-            ) AS accepted,
-
-            COALESCE(
-                SUM(CASE
-                    WHEN type = 'kicked' THEN 1
-                    ELSE 0
-                END),
-                0
-            ) AS kicked
+            ) AS accepted
 
         FROM events
         """
@@ -287,10 +276,8 @@ async def build_stats() -> str:
     row = await cur.fetchone()
     await cur.close()
 
-    total = row[0]
     unique = row[1]
     accepted = row[2]
-    kicked = row[3]
 
     pending = request_queue.qsize()
 
@@ -301,18 +288,19 @@ async def build_stats() -> str:
     )
 
     parts = [
-        "<b>📊 Статистика бота</b>",
         f"Статус: {status}",
         "",
-        f"📥 <b>Авто заявки:</b> {titles[LINK_CHANNEL]}",
-        f"🚫 <b>Авто кик:</b> {titles[SUB_CHANNEL]}",
+        f"Канал: {titles[CHANNEL]}",
         "",
         f"✅ Принято: <code>{accepted}</code>",
-        f"🚫 Кикнуто: <code>{kicked}</code>",
         f"👤 Уникальных: <code>{unique}</code>",
-        "",
-        f"📋 В очереди заявок: <code>{pending}</code>",
     ]
+
+    if pending > 0:
+        parts.extend([
+            "",
+            f"📋 В очереди заявок: <code>{pending}</code>",
+        ])
 
     return "\n".join(parts)
 
@@ -322,7 +310,7 @@ async def build_stats() -> str:
 # =========================
 
 async def load_titles() -> None:
-    for ch in (LINK_CHANNEL, SUB_CHANNEL):
+    for ch in (CHANNEL,):
         try:
             chat = await bot.get_chat(ch)
 
@@ -386,60 +374,12 @@ async def reply_admin(chat_id: int, text: str) -> None:
 # JOIN REQUEST HANDLER
 # =========================
 
-@dp.chat_join_request(F.chat.id == LINK_CHANNEL)
+@dp.chat_join_request(F.chat.id == CHANNEL)
 async def on_join_request(req: ChatJoinRequest) -> None:
     await enqueue_request(
         req.chat.id,
         req.from_user.id,
     )
-
-
-# =========================
-# CHAT MEMBER HANDLER
-# =========================
-
-@dp.chat_member(F.chat.id == SUB_CHANNEL)
-async def on_chat_member(ev: ChatMemberUpdated) -> None:
-    if read_state() != "1":
-        return
-
-    if ev.new_chat_member.status != ChatMemberStatus.MEMBER:
-        return
-
-    if ev.old_chat_member.status not in (
-        ChatMemberStatus.LEFT,
-        ChatMemberStatus.KICKED,
-    ):
-        return
-
-    uid = ev.new_chat_member.user.id
-
-    try:
-        await bot.ban_chat_member(
-            SUB_CHANNEL,
-            uid,
-        )
-
-        await bot.unban_chat_member(
-            SUB_CHANNEL,
-            uid,
-        )
-
-    except Exception:
-        pass
-
-    try:
-        await bot.unban_chat_member(
-            LINK_CHANNEL,
-            uid,
-        )
-    except Exception:
-        pass
-
-    try:
-        await log_event("kicked", uid)
-    except Exception:
-        pass
 
 
 # =========================
@@ -576,7 +516,12 @@ async def cb_refresh(cb: CallbackQuery) -> None:
 
 async def auto_refresh() -> None:
     while True:
-        await asyncio.sleep(6 * 3600)
+        now = time.time()
+
+        # Ждём до ближайшего :00 минут (раз в час).
+        delay = 3600 - (now % 3600)
+
+        await asyncio.sleep(delay)
 
         if last_stats_msg and last_stats_msg in admin_msgs:
             try:
@@ -646,7 +591,6 @@ async def run_polling() -> None:
                 allowed_updates=[
                     "message",
                     "chat_join_request",
-                    "chat_member",
                     "callback_query",
                 ],
             )
